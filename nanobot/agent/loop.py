@@ -146,12 +146,23 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+    async def _run_agent_loop(
+        self,
+        initial_messages: list[dict],
+        session: "Session | None" = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        is_continuation: bool = False,
+    ) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
 
         Args:
             initial_messages: Starting messages for the LLM conversation.
+            session: Optional session for state storage (paused_loop).
+            channel: Channel for sending pause notifications.
+            chat_id: Chat ID for sending pause notifications.
+            is_continuation: If True, this is a continuation from a paused loop.
 
         Returns:
             Tuple of (final_content, list_of_tools_used).
@@ -202,7 +213,53 @@ class AgentLoop:
                 final_content = response.content
                 break
 
+        # Check if we hit max_iterations without getting a final response
+        if final_content is None and iteration >= self.max_iterations:
+            logger.warning(f"Max iterations ({self.max_iterations}) reached for session")
+            # Store state for potential /continue
+            if session:
+                session.metadata["paused_loop"] = {
+                    "messages": messages,
+                    "tools_used": tools_used,
+                }
+                self.sessions.save(session)
+            # Notify user if we have channel info (but not if this is a continuation - avoid duplicate warning)
+            if channel and chat_id and not is_continuation:
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=f"⚠️ Maximum steps ({self.max_iterations}) reached. Use /continue to continue."
+                ))
+
         return final_content, tools_used
+
+    async def _continue_agent_loop(
+        self,
+        messages: list[dict],
+        session: "Session | None" = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+    ) -> tuple[str | None, list[str]]:
+        """
+        Continue the agent loop from a paused state with reset iteration counter.
+        Delegates to _run_agent_loop with is_continuation=True to avoid duplicate warnings.
+
+        Args:
+            messages: Current message state from paused loop.
+            session: Optional session for state storage.
+            channel: Channel for message sending.
+            chat_id: Chat ID for message sending.
+
+        Returns:
+            Tuple of (final_content, list_of_tools_used).
+        """
+        return await self._run_agent_loop(
+            initial_messages=messages,
+            session=session,
+            channel=channel,
+            chat_id=chat_id,
+            is_continuation=True,
+        )
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -284,7 +341,69 @@ class AgentLoop:
                                   content="New session started. Memory consolidation in progress.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/compact — Compress context to save tokens\n/help — Show available commands\n/verbose on|off — Toggle verbose mode (show tool calls and reasoning)\n/continue — Continue after max steps reached")
+        
+        if cmd == "/continue":
+            # Check if there's a paused loop to continue
+            if not session.metadata.get("paused_loop"):
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                      content="No paused operation to continue. Send a message to start a new conversation.")
+            
+            # Resume the loop from where it left off
+            paused_data = session.metadata.pop("paused_loop")
+            self.sessions.save(session)
+            
+            # Restore the messages state
+            messages = paused_data["messages"]
+            tools_used = paused_data.get("tools_used", [])
+            
+            # Continue the agent loop with reset iteration counter
+            final_content, additional_tools = await self._continue_agent_loop(
+                messages, session=session, channel=msg.channel, chat_id=msg.chat_id
+            )
+            tools_used.extend(additional_tools)
+            
+            if final_content is None:
+                # Still paused (hit max_iterations again)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"⏳ Maximum steps ({self.max_iterations}) reached again. Use /continue to continue."
+                )
+            
+            # Success - save the response
+            session.add_message("assistant", final_content,
+                                tools_used=tools_used if tools_used else None)
+            self.sessions.save(session)
+            
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=final_content,
+                metadata=msg.metadata or {},
+            )
+        
+        # Handle verbose command
+        verbose_match = None
+        if cmd.startswith("/verbose "):
+            verbose_match = cmd[9:].strip()
+        elif cmd.startswith("/v "):
+            verbose_match = cmd[3:].strip()
+        
+        if verbose_match in ("on", "off"):
+            is_verbose = verbose_match == "on"
+            session.metadata["verbose"] = is_verbose
+            self.sessions.save(session)
+            status = "enabled 🔊" if is_verbose else "disabled 🔇"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"Verbose mode {status}.\n{'Tool calls and reasoning will be shown.' if is_verbose else 'Running in quiet mode.'}")
+        
+        # Show current status if no valid argument provided
+        if cmd in ["/verbose", "/v"]:
+            is_verbose = session.metadata.get("verbose", False)
+            status = "ON 🔊" if is_verbose else "OFF 🔇"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
+                                  content=f"Verbose mode is currently {status}\n\nUse `/verbose on` or `/verbose off` to change.")
         
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
