@@ -15,9 +15,18 @@ class BaseChannel(ABC):
     
     Each channel (Telegram, Discord, etc.) should implement this interface
     to integrate with the nanobot message bus.
+    
+    Channel addons can register via Python entry points:
+    [project.entry-points."nanobot.channels"]
+    mychannel = "my_package:MyChannelClass"
     """
     
     name: str = "base"
+    version: str = "1.0.0"
+    description: str = ""
+    author: str = ""
+    requires: list[str] = []  # List of optional dependency packages
+    config_schema: dict[str, Any] | None = None  # JSON Schema for config validation
     
     def __init__(self, config: Any, bus: MessageBus):
         """

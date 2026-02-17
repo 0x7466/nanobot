@@ -1,6 +1,8 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Any
+
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings
 
@@ -142,8 +144,21 @@ class QQConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
 
+class AddonChannelConfig(BaseModel):
+    """Configuration for an addon channel (plugin).
+    
+    Each addon channel can have arbitrary configuration dict,
+    allowing maximum flexibility for third-party channels.
+    """
+    enabled: bool = False
+    config: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arbitrary configuration dict for the addon channel"
+    )
+
+
 class ChannelsConfig(BaseModel):
-    """Configuration for chat channels."""
+    """Configuration for chat channels (core + addons)."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -153,6 +168,10 @@ class ChannelsConfig(BaseModel):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    addons: dict[str, AddonChannelConfig] = Field(
+        default_factory=dict,
+        description="Addon channel configurations. Each key is a channel name, value is the config."
+    )
 
 
 class AgentDefaults(BaseModel):
@@ -235,6 +254,10 @@ class ToolsConfig(BaseModel):
 
 class Config(BaseSettings):
     """Root configuration for nanobot."""
+
+
+# Backwards compatibility / alias for tests and addons
+RootConfig = Config
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)

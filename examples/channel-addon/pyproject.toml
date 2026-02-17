@@ -1,0 +1,17 @@
+[project]
+name = "nanobot-webhook-example"
+version = "1.0.0"
+description = "Example webhook channel addon for nanobot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nanobot",
+    "aiohttp>=3.8.0",
+]
+
+[project.entry-points."nanobot.channels"]
+webhook-example = "webhook_channel:WebhookChannel"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

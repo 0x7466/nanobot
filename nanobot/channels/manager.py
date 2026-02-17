@@ -18,7 +18,8 @@ class ChannelManager:
     Manages chat channels and coordinates message routing.
     
     Responsibilities:
-    - Initialize enabled channels (Telegram, WhatsApp, etc.)
+    - Initialize enabled core channels (Telegram, WhatsApp, etc.)
+    - Load and initialize addon channels via entry points
     - Start/stop channels
     - Route outbound messages
     """
@@ -28,114 +29,140 @@ class ChannelManager:
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
+        self._addon_channels: dict[str, type[BaseChannel]] = {}  # Registry of discovered addons
         
         self._init_channels()
     
     def _init_channels(self) -> None:
-        """Initialize channels based on config."""
+        """Initialize all channels (core + addons)."""
+        self._load_core_channels()
+        self._load_addon_channels()
+    
+    def _load_core_channels(self) -> None:
+        """Initialize built-in core channels based on config."""
+        core_channels = [
+            ("telegram", "nanobot.channels.telegram", "TelegramChannel", 
+             lambda cfg, bus: self._init_telegram(cfg, bus)),
+            ("whatsapp", "nanobot.channels.whatsapp", "WhatsAppChannel",
+             lambda cfg, bus: self._init_whatsapp(cfg, bus)),
+            ("discord", "nanobot.channels.discord", "DiscordChannel",
+             lambda cfg, bus: self._init_discord(cfg, bus)),
+            ("feishu", "nanobot.channels.feishu", "FeishuChannel",
+             lambda cfg, bus: self._init_feishu(cfg, bus)),
+            ("mochat", "nanobot.channels.mochat", "MochatChannel",
+             lambda cfg, bus: self._init_mochat(cfg, bus)),
+            ("dingtalk", "nanobot.channels.dingtalk", "DingTalkChannel",
+             lambda cfg, bus: self._init_dingtalk(cfg, bus)),
+            ("email", "nanobot.channels.email", "EmailChannel",
+             lambda cfg, bus: self._init_email(cfg, bus)),
+            ("slack", "nanobot.channels.slack", "SlackChannel",
+             lambda cfg, bus: self._init_slack(cfg, bus)),
+            ("qq", "nanobot.channels.qq", "QQChannel",
+             lambda cfg, bus: self._init_qq(cfg, bus)),
+        ]
         
-        # Telegram channel
-        if self.config.channels.telegram.enabled:
-            try:
-                from nanobot.channels.telegram import TelegramChannel
-                self.channels["telegram"] = TelegramChannel(
-                    self.config.channels.telegram,
-                    self.bus,
-                    groq_api_key=self.config.providers.groq.api_key,
-                )
-                logger.info("Telegram channel enabled")
-            except ImportError as e:
-                logger.warning(f"Telegram channel not available: {e}")
-        
-        # WhatsApp channel
-        if self.config.channels.whatsapp.enabled:
-            try:
-                from nanobot.channels.whatsapp import WhatsAppChannel
-                self.channels["whatsapp"] = WhatsAppChannel(
-                    self.config.channels.whatsapp, self.bus
-                )
-                logger.info("WhatsApp channel enabled")
-            except ImportError as e:
-                logger.warning(f"WhatsApp channel not available: {e}")
-
-        # Discord channel
-        if self.config.channels.discord.enabled:
-            try:
-                from nanobot.channels.discord import DiscordChannel
-                self.channels["discord"] = DiscordChannel(
-                    self.config.channels.discord, self.bus
-                )
-                logger.info("Discord channel enabled")
-            except ImportError as e:
-                logger.warning(f"Discord channel not available: {e}")
-        
-        # Feishu channel
-        if self.config.channels.feishu.enabled:
-            try:
-                from nanobot.channels.feishu import FeishuChannel
-                self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus
-                )
-                logger.info("Feishu channel enabled")
-            except ImportError as e:
-                logger.warning(f"Feishu channel not available: {e}")
-
-        # Mochat channel
-        if self.config.channels.mochat.enabled:
-            try:
-                from nanobot.channels.mochat import MochatChannel
-
-                self.channels["mochat"] = MochatChannel(
-                    self.config.channels.mochat, self.bus
-                )
-                logger.info("Mochat channel enabled")
-            except ImportError as e:
-                logger.warning(f"Mochat channel not available: {e}")
-
-        # DingTalk channel
-        if self.config.channels.dingtalk.enabled:
-            try:
-                from nanobot.channels.dingtalk import DingTalkChannel
-                self.channels["dingtalk"] = DingTalkChannel(
-                    self.config.channels.dingtalk, self.bus
-                )
-                logger.info("DingTalk channel enabled")
-            except ImportError as e:
-                logger.warning(f"DingTalk channel not available: {e}")
-
-        # Email channel
-        if self.config.channels.email.enabled:
-            try:
-                from nanobot.channels.email import EmailChannel
-                self.channels["email"] = EmailChannel(
-                    self.config.channels.email, self.bus
-                )
-                logger.info("Email channel enabled")
-            except ImportError as e:
-                logger.warning(f"Email channel not available: {e}")
-
-        # Slack channel
-        if self.config.channels.slack.enabled:
-            try:
-                from nanobot.channels.slack import SlackChannel
-                self.channels["slack"] = SlackChannel(
-                    self.config.channels.slack, self.bus
-                )
-                logger.info("Slack channel enabled")
-            except ImportError as e:
-                logger.warning(f"Slack channel not available: {e}")
-
-        # QQ channel
-        if self.config.channels.qq.enabled:
-            try:
-                from nanobot.channels.qq import QQChannel
-                self.channels["qq"] = QQChannel(
-                    self.config.channels.qq,
-                    self.bus,
-                )
-                logger.info("QQ channel enabled")
-            except ImportError as e:
-                logger.warning(f"QQ channel not available: {e}")
+        for name, module_path, class_name, initializer in core_channels:
+            config_obj = getattr(self.config.channels, name, None)
+            if config_obj and getattr(config_obj, "enabled", False):
+                try:
+                    initializer(config_obj, self.bus)
+                    logger.info(f"Core channel '{name}' enabled")
+                except ImportError as e:
+                    logger.warning(f"Core channel '{name}' not available: {e}")
+                except Exception as e:
+                    logger.error(f"Failed to initialize core channel '{name}': {e}")
+    
+    def _load_addon_channels(self) -> None:
+        """Discover and load addon channels via Python entry points."""
+        try:
+            import importlib.metadata as metadata
+            
+            entry_points = metadata.entry_points(group="nanobot.channels")
+            
+            for ep in entry_points:
+                channel_name = ep.name
+                
+                # Check if this addon is enabled in config
+                from nanobot.config.schema import AddonChannelConfig
+                addon_config = self.config.channels.addons.get(channel_name)
+                
+                # Handle both dict and AddonChannelConfig objects
+                if isinstance(addon_config, dict):
+                    if not addon_config.get("enabled", False):
+                        continue
+                    config_dict = addon_config.get("config", {})
+                elif isinstance(addon_config, AddonChannelConfig):
+                    if not addon_config.enabled:
+                        continue
+                    config_dict = addon_config.config
+                else:
+                    # No config found for this addon
+                    continue
+                
+                try:
+                    channel_class = ep.load()
+                    
+                    # Validate it's a proper BaseChannel subclass
+                    if not isinstance(channel_class, type) or not issubclass(channel_class, BaseChannel):
+                        logger.warning(f"Addon '{channel_name}' is not a valid BaseChannel subclass")
+                        continue
+                    
+                    # Store in registry
+                    self._addon_channels[channel_name] = channel_class
+                    
+                    # Instantiate with config dict
+                    channel_instance = channel_class(config_dict, self.bus)
+                    self.channels[channel_name] = channel_instance
+                    
+                    logger.info(
+                        f"Addon channel '{channel_name}' enabled "
+                        f"({channel_class.__module__}.{channel_class.__name__})"
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Failed to load addon channel '{channel_name}': {e}")
+                    
+        except ImportError:
+            logger.debug("importlib.metadata not available, skipping addon discovery")
+    
+    # Core channel initializers
+    def _init_telegram(self, config, bus):
+        from nanobot.channels.telegram import TelegramChannel
+        self.channels["telegram"] = TelegramChannel(
+            config, bus, groq_api_key=self.config.providers.groq.api_key
+        )
+    
+    def _init_whatsapp(self, config, bus):
+        from nanobot.channels.whatsapp import WhatsAppChannel
+        self.channels["whatsapp"] = WhatsAppChannel(config, bus)
+    
+    def _init_discord(self, config, bus):
+        from nanobot.channels.discord import DiscordChannel
+        self.channels["discord"] = DiscordChannel(config, bus)
+    
+    def _init_feishu(self, config, bus):
+        from nanobot.channels.feishu import FeishuChannel
+        self.channels["feishu"] = FeishuChannel(config, bus)
+    
+    def _init_mochat(self, config, bus):
+        from nanobot.channels.mochat import MochatChannel
+        self.channels["mochat"] = MochatChannel(config, bus)
+    
+    def _init_dingtalk(self, config, bus):
+        from nanobot.channels.dingtalk import DingTalkChannel
+        self.channels["dingtalk"] = DingTalkChannel(config, bus)
+    
+    def _init_email(self, config, bus):
+        from nanobot.channels.email import EmailChannel
+        self.channels["email"] = EmailChannel(config, bus)
+    
+    def _init_slack(self, config, bus):
+        from nanobot.channels.slack import SlackChannel
+        self.channels["slack"] = SlackChannel(config, bus)
+    
+    def _init_qq(self, config, bus):
+        from nanobot.channels.qq import QQChannel
+        self.channels["qq"] = QQChannel(config, bus)
     
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""
@@ -225,3 +252,96 @@ class ChannelManager:
     def enabled_channels(self) -> list[str]:
         """Get list of enabled channel names."""
         return list(self.channels.keys())
+    
+    async def send_to_channel(self, channel_name: str, message: OutboundMessage) -> None:
+        """Send a message to a specific channel.
+        
+        Args:
+            channel_name: Name of the channel to send to.
+            message: The message to send.
+            
+        Raises:
+            ValueError: If the channel doesn't exist.
+        """
+        channel = self.channels.get(channel_name)
+        if not channel:
+            raise ValueError(f"Channel '{channel_name}' not found")
+        
+        await channel.send(message)
+    
+    def list_available_channels(self) -> list[str]:
+        """List all available channels (core + discovered addons).
+        
+        Returns:
+            List of all channel names that are available.
+        """
+        available = set(self.channels.keys())
+        
+        # Add discovered addon channels that aren't loaded
+        try:
+            import importlib.metadata as metadata
+            entry_points = metadata.entry_points(group="nanobot.channels")
+            for ep in entry_points:
+                available.add(ep.name)
+        except ImportError:
+            pass
+        
+        return sorted(list(available))
+    
+    def get_channel_info(self, channel_name: str) -> dict[str, Any] | None:
+        """Get metadata information about a channel.
+        
+        Args:
+            channel_name: Name of the channel.
+            
+        Returns:
+            Dict with channel metadata, or None if channel doesn't exist.
+        """
+        # Check if it's a loaded channel instance
+        if channel_name in self.channels:
+            channel = self.channels[channel_name]
+            return {
+                "name": channel.name,
+                "version": getattr(channel, "version", "unknown"),
+                "description": getattr(channel, "description", ""),
+                "author": getattr(channel, "author", ""),
+                "enabled": True,
+                "loaded": True,
+            }
+        
+        # Check if it's a discovered addon that's not loaded
+        if channel_name in self._addon_channels:
+            channel_class = self._addon_channels[channel_name]
+            return {
+                "name": getattr(channel_class, "name", channel_name),
+                "version": getattr(channel_class, "version", "unknown"),
+                "description": getattr(channel_class, "description", ""),
+                "author": getattr(channel_class, "author", ""),
+                "enabled": False,
+                "loaded": False,
+            }
+        
+        # Try to discover it without loading
+        try:
+            import importlib.metadata as metadata
+            entry_points = metadata.entry_points(group="nanobot.channels")
+            for ep in entry_points:
+                if ep.name == channel_name:
+                    try:
+                        channel_class = ep.load()
+                        if issubclass(channel_class, BaseChannel):
+                            return {
+                                "name": getattr(channel_class, "name", channel_name),
+                                "version": getattr(channel_class, "version", "unknown"),
+                                "description": getattr(channel_class, "description", ""),
+                                "author": getattr(channel_class, "author", ""),
+                                "enabled": False,
+                                "loaded": False,
+                            }
+                    except Exception:
+                        pass
+                    break
+        except ImportError:
+            pass
+        
+        return None
